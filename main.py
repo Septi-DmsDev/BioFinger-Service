@@ -293,6 +293,24 @@ async def health():
     return {"status": "ok", "time": datetime.now(WIB).isoformat()}
 
 
+@app_router.post("/sync/{target_date}")
+async def trigger_sync(target_date: str):
+    """Trigger manual sync untuk tanggal tertentu (format: YYYY-MM-DD)."""
+    try:
+        d = date.fromisoformat(target_date)
+    except ValueError:
+        return {"error": "Format tanggal tidak valid. Gunakan YYYY-MM-DD."}
+    send_batch_for_date(d)
+    return {"status": "ok", "synced_date": target_date}
+
+
+@app_router.post("/sync-now")
+async def trigger_sync_now():
+    """Trigger manual sync untuk hari ini dan kemarin."""
+    scheduled_sync()
+    return {"status": "ok", "time": datetime.now(WIB).isoformat()}
+
+
 # ---------------------------------------------------------------------------
 # Lifespan: init DB + scheduler
 # ---------------------------------------------------------------------------
