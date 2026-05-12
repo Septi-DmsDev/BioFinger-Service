@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ADMS Receiver — ZKTeco AT301
-Menerima absensi & fingerprint dari mesin, kirim ke HRD Dashboard.
+Menerima data absensi dari mesin, kirim ke HRD Dashboard.
 
 Env vars (Coolify):
   DATABASE_URL       — postgres connection string Supabase (PgBouncer port 5433)
@@ -97,73 +97,6 @@ def get_all_device_sns() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Fingerprint storage — mendukung dua format firmware:
-#   key=value : Pin=0067\tFid=0\tSize=498\tValid=1\ttmp=BASE64  (fw8.x FPTrans)
-#   positional: code\tfinger_id\tsize\tvalid\ttemplate           (format lama)
-# ---------------------------------------------------------------------------
-def store_biodata(device_sn: str, raw_body: str) -> int:
-    statements = []
-
-    for line in raw_body.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-
-        if "\t" in line and "=" in line.split("\t")[0]:
-            # Format key=value
-            fields: dict[str, str] = {}
-            for part in line.split("\t"):
-                if "=" in part:
-                    k, _, v = part.partition("=")
-                    fields[k.strip().lower()] = v.strip()
-            employee_code = fields.get("pin")
-            finger_id_str = fields.get("fid") or fields.get("type")
-            template_data = fields.get("tmp") or fields.get("template")
-            if not employee_code or finger_id_str is None or not template_data:
-                continue
-            try:
-                finger_id = int(finger_id_str)
-                valid = int(fields.get("valid", "1"))
-                template_size = int(fields.get("size", "0")) or len(template_data)
-            except ValueError:
-                continue
-        else:
-            # Format positional
-            parts = line.split("\t")
-            if len(parts) < 5:
-                continue
-            try:
-                employee_code = parts[0].strip()
-                finger_id = int(parts[1].strip())
-                template_size = int(parts[2].strip())
-                valid = int(parts[3].strip())
-                template_data = parts[4].strip()
-            except (ValueError, IndexError):
-                continue
-
-        if not template_data or valid != 1:
-            continue
-
-        statements.append(("""
-            INSERT INTO adms_biodata
-                (employee_code, finger_id, template_size, valid, template_data, source_device, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (employee_code, finger_id) DO UPDATE SET
-                template_size = EXCLUDED.template_size,
-                valid         = EXCLUDED.valid,
-                template_data = EXCLUDED.template_data,
-                source_device = EXCLUDED.source_device,
-                updated_at    = NOW()
-        """, (employee_code, finger_id, template_size, valid, template_data, device_sn)))
-
-    if statements:
-        db_run_many(statements)
-        log.info(f"[{device_sn}] {len(statements)} fingerprint tersimpan.")
-
-    return len(statements)
-
-
-# ---------------------------------------------------------------------------
 # Attendance storage
 # ---------------------------------------------------------------------------
 def store_punches(device_sn: str, raw_body: str):
@@ -193,8 +126,8 @@ def store_punches(device_sn: str, raw_body: str):
 # ---------------------------------------------------------------------------
 # Batch sender ke HRD Dashboard
 # ---------------------------------------------------------------------------
-PUNCH_MASUK           = 0
-PUNCH_PULANG          = 1
+PUNCH_MASUK            = 0
+PUNCH_PULANG           = 1
 PUNCH_KELUAR_ISTIRAHAT = 2
 PUNCH_MASUK_ISTIRAHAT  = 3
 
@@ -301,13 +234,11 @@ async def device_handshake(
         f"GET OPTION FROM: {SN}\r\n"
         f"ATTLOGStamp=0\r\n"
         f"OPERLOGStamp=9999\r\n"
-        f"BIODATAStamp=0\r\n"
-        f"FPTrans=1\r\n"
         f"ErrorDelay=30\r\n"
         f"Delay=10\r\n"
         f"TransTimes=09:00;14:00;17:00;21:00\r\n"
         f"TransInterval=1\r\n"
-        f"TransFlag=TransData AttLog FPTrans\r\n"
+        f"TransFlag=TransData AttLog\r\n"
         f"TimeZone=7\r\n"
         f"Realtime=1\r\n"
         f"Encrypt=None\r\n"
@@ -327,12 +258,8 @@ async def receive_data(
 
     if table == "ATTLOG":
         store_punches(SN, raw)
-    elif table in ("BIODATA", "FP", "FPTRANSACTION"):
-        count = store_biodata(SN, raw)
-        if count == 0:
-            log.warning(f"[{SN}] Terima {table} tapi 0 baris berhasil diparse.")
     else:
-        log.info(f"[{SN}] Tabel tidak dikenal: {table} (Stamp={Stamp})")
+        log.info(f"[{SN}] Tabel diabaikan: {table} (Stamp={Stamp})")
 
     return PlainTextResponse("OK")
 
@@ -384,13 +311,16 @@ async def device_cmd(request: Request, SN: str = Query(...)):
 async def health():
     devices = get_all_device_sns()
     pending = db_one("SELECT COUNT(*) as n FROM adms_command_queue WHERE sent_at IS NULL")["n"]
-    fp_count = db_one("SELECT COUNT(*) as n FROM adms_biodata")["n"]
+    punch_today = db_one("""
+        SELECT COUNT(*) as n FROM adms_punch_logs
+        WHERE punch_time::date = CURRENT_DATE
+    """)["n"]
     return {
         "status": "ok",
         "time": datetime.now(WIB).isoformat(),
         "devices": devices,
         "pending_commands": pending,
-        "fingerprints_stored": fp_count,
+        "punches_today": punch_today,
     }
 
 
@@ -417,10 +347,10 @@ async def list_devices():
 
 @app_router.get("/inject-employees")
 async def inject_employees(force: int = Query(0)):
-    """Antrekan karyawan aktif ke semua mesin.
+    """Antrekan karyawan aktif dari HRD Dashboard ke semua mesin.
 
-    Secara default hanya inject karyawan BARU yang belum pernah dikirim ke mesin.
-    Tambahkan ?force=1 untuk inject ulang semua (gunakan jika mesin di-reset/baru).
+    Default: hanya inject karyawan BARU yang belum pernah dikirim ke mesin.
+    Gunakan ?force=1 jika mesin di-reset atau mesin baru ditambahkan.
     """
     if not ADMS_INGEST_TOKEN:
         return {"error": "ADMS_INGEST_TOKEN belum diset."}
@@ -443,7 +373,6 @@ async def inject_employees(force: int = Query(0)):
     if not device_sns:
         return {"error": "Belum ada mesin terdaftar. Pastikan mesin sudah terhubung ke server."}
 
-    # Hapus command DATA USER yang belum terkirim (akan di-queue ulang jika perlu)
     db_run("DELETE FROM adms_command_queue WHERE sent_at IS NULL AND command_text LIKE 'DATA USER%'")
 
     statements = []
@@ -453,20 +382,16 @@ async def inject_employees(force: int = Query(0)):
         if force:
             already_sent: set[str] = set()
         else:
-            # Ambil employee codes yang sudah pernah terkirim ke mesin ini
             rows = db_all("""
                 SELECT command_text FROM adms_command_queue
                 WHERE target_device = %s
                   AND sent_at IS NOT NULL
                   AND command_text LIKE 'DATA USER PIN=%'
             """, (sn,))
-            already_sent: set[str] = set()
+            already_sent = set()
             for r in rows:
-                # Ekstrak PIN dari "DATA USER PIN=0067\tName=..."
-                txt: str = r["command_text"]
                 try:
-                    pin_part = txt.split("\t")[0]  # "DATA USER PIN=0067"
-                    pin = pin_part.split("PIN=")[1]
+                    pin = r["command_text"].split("\t")[0].split("PIN=")[1]
                     already_sent.add(pin)
                 except IndexError:
                     pass
@@ -492,58 +417,13 @@ async def inject_employees(force: int = Query(0)):
         db_run_many(statements)
 
     total = len(statements)
-    log.info(f"inject-employees: {total} command baru, skip={skipped_per_device} (force={bool(force)})")
+    log.info(f"inject-employees: {total} baru, skip={skipped_per_device} (force={bool(force)})")
     return {
         "status": "ok",
         "total_queued": total,
         "skipped_existing": skipped_per_device,
         "devices": device_sns,
         "tip": "Gunakan ?force=1 jika mesin di-reset dan perlu inject ulang semua karyawan.",
-    }
-
-
-@app_router.get("/inject-fingerprints")
-async def inject_fingerprints(target: str = Query(None)):
-    """Antrekan semua fingerprint tersimpan ke semua mesin (atau ?target=SN untuk satu mesin)."""
-    templates = db_all(
-        "SELECT employee_code, finger_id, template_size, template_data FROM adms_biodata WHERE valid = 1"
-    )
-    if not templates:
-        return {"status": "ok", "queued": 0, "message": "Belum ada fingerprint tersimpan."}
-
-    device_sns = [target] if target else get_all_device_sns()
-    if not device_sns:
-        return {"error": "Belum ada mesin terdaftar."}
-
-    if target:
-        db_run(
-            "DELETE FROM adms_command_queue WHERE target_device = %s AND sent_at IS NULL AND command_text LIKE 'DATA FP%'",
-            (target,),
-        )
-    else:
-        db_run("DELETE FROM adms_command_queue WHERE sent_at IS NULL AND command_text LIKE 'DATA FP%'")
-
-    statements = []
-    for sn in device_sns:
-        for t in templates:
-            cmd = (
-                f"DATA FP PIN={t['employee_code']}\t"
-                f"FID={t['finger_id']}\t"
-                f"Size={t['template_size']}\tValid=1\tTEMPLATE={t['template_data']}"
-            )
-            statements.append((
-                "INSERT INTO adms_command_queue (target_device, command_text) VALUES (%s, %s)",
-                (sn, cmd),
-            ))
-    db_run_many(statements)
-
-    total = len(templates) * len(device_sns)
-    log.info(f"inject-fingerprints: {len(templates)} template × {len(device_sns)} mesin = {total} command.")
-    return {
-        "status": "ok",
-        "fingerprints": len(templates),
-        "devices": device_sns,
-        "total_queued": total,
     }
 
 
