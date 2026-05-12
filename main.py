@@ -142,6 +142,67 @@ def store_biodata(device_sn: str, raw_body: str):
         _queue_fingerprints_to_other_devices(device_sn, new_templates)
 
 
+def store_querydata_biodata(device_sn: str, raw_body: str) -> int:
+    """Parse format key=value dari /iclock/querydata (respon DATA QUERY biodata).
+
+    Tiap baris: Pin=0067\tFid=0\tSize=498\tValid=1\ttmp=BASE64...
+    Fieldname bisa bervariasi tergantung firmware (Type vs Fid, tmp vs Template).
+    """
+    new_templates: list[tuple] = []
+    statements = []
+
+    for line in raw_body.strip().splitlines():
+        fields: dict[str, str] = {}
+        for part in line.strip().split("\t"):
+            if "=" in part:
+                k, _, v = part.partition("=")
+                fields[k.strip().lower()] = v.strip()
+
+        employee_code = fields.get("pin")
+        finger_id_str = fields.get("fid") or fields.get("type")
+        template_data = fields.get("tmp") or fields.get("template")
+
+        if not employee_code or finger_id_str is None or not template_data:
+            log.debug(f"[{device_sn}] querydata baris dilewati: {line[:80]!r}")
+            continue
+
+        try:
+            finger_id = int(finger_id_str)
+        except ValueError:
+            continue
+
+        try:
+            valid = int(fields.get("valid", "1"))
+        except ValueError:
+            valid = 1
+
+        try:
+            template_size = int(fields.get("size", "0")) or len(template_data)
+        except ValueError:
+            template_size = len(template_data)
+
+        statements.append(("""
+            INSERT INTO adms_biodata
+                (employee_code, finger_id, template_size, valid, template_data, source_device, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (employee_code, finger_id) DO UPDATE SET
+                template_size = EXCLUDED.template_size,
+                valid         = EXCLUDED.valid,
+                template_data = EXCLUDED.template_data,
+                source_device = EXCLUDED.source_device,
+                updated_at    = NOW()
+        """, (employee_code, finger_id, template_size, valid, template_data, device_sn)))
+
+        new_templates.append((employee_code, finger_id, template_size, template_data))
+
+    if statements:
+        db_run_many(statements)
+        log.info(f"[{device_sn}] querydata: {len(new_templates)} fingerprint disimpan.")
+        _queue_fingerprints_to_other_devices(device_sn, new_templates)
+
+    return len(statements)
+
+
 def _queue_fingerprints_to_other_devices(source_sn: str, templates: list[tuple]):
     other_sns = [sn for sn in get_all_device_sns() if sn != source_sn]
     if not other_sns:
@@ -287,17 +348,17 @@ app_router = FastAPI(title="ADMS Receiver")
 async def device_handshake(SN: str = Query(...), options: str = Query(None), pushver: str = Query(None)):
     register_device(SN)
     log.info(f"[{SN}] Handshake dari mesin.")
+    # BIODATAStamp/FPTrans tidak dipakai — AT301 fw8.x tidak auto-push fingerprint.
+    # Fingerprint diambil via DATA QUERY biodata (aktif oleh server, bukan mesin).
     config = (
         f"GET OPTION FROM: {SN}\r\n"
         f"ATTLOGStamp=0\r\n"
         f"OPERLOGStamp=9999\r\n"
-        f"BIODATAStamp=0\r\n"
-        f"FPTrans=1\r\n"
         f"ErrorDelay=30\r\n"
         f"Delay=10\r\n"
         f"TransTimes=09:00;14:00;17:00;21:00\r\n"
         f"TransInterval=1\r\n"
-        f"TransFlag=TransData AttLog OpLog FPTrans\r\n"
+        f"TransFlag=TransData AttLog\r\n"
         f"TimeZone=7\r\n"
         f"Realtime=1\r\n"
         f"Encrypt=None\r\n"
@@ -349,6 +410,39 @@ async def device_cmd(SN: str = Query(...), ID: str = Query(None), Return: str = 
             log.info(f"[{SN}] Command #{ID} dikonfirmasi (Return={Return})")
         except Exception as exc:
             log.warning(f"[{SN}] Gagal konfirmasi command {ID}: {exc}")
+    return PlainTextResponse("OK")
+
+
+@app_router.post("/iclock/querydata", response_class=PlainTextResponse)
+async def receive_querydata(
+    request: Request,
+    SN: str = Query(...),
+    type: str = Query(None),
+    cmdid: str = Query(None),
+):
+    """Endpoint yang dipanggil mesin setelah menerima command C:ID:DATA QUERY biodata.
+
+    Device mengirim fingerprint templates satu per baris (key=value tab-separated).
+    """
+    body = await request.body()
+    raw = body.decode("utf-8", errors="ignore")
+    log.info(f"[{SN}] querydata type={type} cmdid={cmdid} ({len(raw)} bytes)")
+
+    if type == "biodata":
+        count = store_querydata_biodata(SN, raw)
+        log.info(f"[{SN}] Total {count} template diproses dari querydata.")
+    else:
+        log.info(f"[{SN}] querydata type tidak dikenal: {type!r} — body: {raw[:200]!r}")
+
+    if cmdid:
+        try:
+            db_run(
+                "UPDATE adms_command_queue SET acked_at = NOW() WHERE id = %s",
+                (int(cmdid),),
+            )
+        except Exception as exc:
+            log.warning(f"[{SN}] Gagal ack querydata cmd {cmdid}: {exc}")
+
     return PlainTextResponse("OK")
 
 
@@ -446,6 +540,34 @@ async def inject_fingerprints(target: str = Query(None)):
     total = len(templates) * len(device_sns)
     log.info(f"Inject fingerprint: {len(templates)} template × {len(device_sns)} mesin = {total} command.")
     return {"status": "ok", "fingerprints": len(templates), "devices": device_sns, "total_queued": total}
+
+
+@app_router.get("/pull-fingerprints")
+async def pull_fingerprints(sn: str = Query(None)):
+    """Antrekan command DATA QUERY biodata ke semua mesin (atau mesin tertentu via ?sn=...).
+
+    Mesin polling /iclock/getrequest setiap ~30 detik, menerima command, lalu
+    POST fingerprint ke /iclock/querydata secara otomatis.
+    """
+    device_sns = [sn] if sn else get_all_device_sns()
+    if not device_sns:
+        return {"error": "Belum ada mesin terdaftar. Pastikan mesin sudah handshake ke server."}
+
+    statements = []
+    for target_sn in device_sns:
+        statements.append((
+            "INSERT INTO adms_command_queue (target_device, command_text) VALUES (%s, %s)",
+            (target_sn, "DATA QUERY biodata"),
+        ))
+    db_run_many(statements)
+
+    log.info(f"Queued DATA QUERY biodata ke {len(device_sns)} mesin: {device_sns}")
+    return {
+        "status": "ok",
+        "devices": device_sns,
+        "queued_command": "DATA QUERY biodata",
+        "note": "Mesin akan merespons ke /iclock/querydata saat polling berikutnya (~30 detik).",
+    }
 
 
 @app_router.get("/devices")
