@@ -22,6 +22,7 @@ import os
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -37,6 +38,10 @@ HRD_API_URL = os.environ.get(
 )
 ADMS_INGEST_TOKEN = os.environ.get("ADMS_INGEST_TOKEN", "")
 DB_PATH = os.environ.get("DB_PATH", "/var/lib/adms-receiver/punches.db")
+
+_parsed = urlparse(HRD_API_URL)
+HRD_BASE_URL = f"{_parsed.scheme}://{_parsed.netloc}"
+HRD_EMPLOYEES_URL = f"{HRD_BASE_URL}/api/integrations/adms/employees"
 
 # Zona waktu WIB (UTC+7) — sesuaikan jika server di timezone berbeda
 WIB = timezone(timedelta(hours=7))
@@ -74,6 +79,15 @@ def init_db():
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_punch_logs_date
             ON punch_logs (employee_code, punch_time, synced)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS command_queue (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                command_text TEXT    NOT NULL,
+                sent_at      TEXT,
+                acked_at     TEXT,
+                created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
         """)
 
 
@@ -278,19 +292,85 @@ async def receive_data(
 
 
 @app_router.get("/iclock/getrequest", response_class=PlainTextResponse)
-async def get_request(SN: str = Query(...)):
-    """Mesin polling untuk command. Tidak ada command, balas OK."""
+async def get_request(SN: str = Query(...), INFO: str = Query(None)):
+    """Mesin polling untuk command. Kirim command tertunda jika ada."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, command_text FROM command_queue WHERE sent_at IS NULL LIMIT 1"
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE command_queue SET sent_at = ? WHERE id = ?",
+                (datetime.now(WIB).isoformat(), row["id"]),
+            )
+            log.info(f"[{SN}] Mengirim command #{row['id']}: {row['command_text'][:60]}...")
+            return PlainTextResponse(f"C:{row['id']}:{row['command_text']}")
     return PlainTextResponse("OK")
 
 
 @app_router.post("/iclock/devicecmd", response_class=PlainTextResponse)
-async def device_cmd(SN: str = Query(...)):
+async def device_cmd(
+    SN: str = Query(...),
+    ID: str = Query(None),
+    Return: str = Query(None),
+):
+    if ID:
+        try:
+            cmd_id = int(ID)
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE command_queue SET acked_at = ? WHERE id = ?",
+                    (datetime.now(WIB).isoformat(), cmd_id),
+                )
+            log.info(f"[{SN}] Command #{cmd_id} dikonfirmasi (Return={Return})")
+        except Exception as exc:
+            log.warning(f"[{SN}] Gagal konfirmasi command {ID}: {exc}")
     return PlainTextResponse("OK")
 
 
 @app_router.get("/health")
 async def health():
     return {"status": "ok", "time": datetime.now(WIB).isoformat()}
+
+
+@app_router.get("/inject-employees")
+async def inject_employees():
+    """Fetch karyawan aktif dari HRD Dashboard dan kirim ke mesin AT301 via command queue."""
+    if not ADMS_INGEST_TOKEN:
+        return {"error": "ADMS_INGEST_TOKEN belum diset."}
+
+    try:
+        resp = requests.get(
+            HRD_EMPLOYEES_URL,
+            headers={"Authorization": f"Bearer {ADMS_INGEST_TOKEN}"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        emp_list = data.get("employees", [])
+    except Exception as exc:
+        return {"error": f"Gagal fetch karyawan dari HRD: {exc}"}
+
+    if not emp_list:
+        return {"status": "ok", "queued": 0, "message": "Tidak ada karyawan aktif."}
+
+    with get_db() as conn:
+        # Hapus command yang belum terkirim (reset antrian)
+        conn.execute("DELETE FROM command_queue WHERE sent_at IS NULL")
+
+        for emp in emp_list:
+            pin = emp["employeeCode"]
+            name = emp["fullName"][:24]  # AT301 max 24 karakter
+            cmd = (
+                f"DATA USER PIN={pin}\tName={name}"
+                f"\tPri=0\tPasswd=\tCard=\tGrp=1\tTZ=0000000100000000\tVerify=0"
+            )
+            conn.execute(
+                "INSERT INTO command_queue (command_text) VALUES (?)", (cmd,)
+            )
+
+    log.info(f"Antrian inject: {len(emp_list)} karyawan.")
+    return {"status": "ok", "queued": len(emp_list)}
 
 
 @app_router.get("/sync/{target_date}")
