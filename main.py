@@ -372,11 +372,16 @@ async def receive_data(request: Request, SN: str = Query(...), table: str = Quer
     raw = body.decode("utf-8", errors="ignore")
     if table == "ATTLOG":
         store_punches(SN, raw)
-    elif table in ("BIODATA", "FP", "FPTRANSACTION"):
-        log.info(f"[{SN}] Menerima tabel biometrik: {table} ({len(raw)} bytes)")
-        store_biodata(SN, raw)
+    elif table in ("BIODATA", "FP", "FPTRANSACTION", "templatev10"):
+        log.info(f"[{SN}] Menerima tabel biometrik via cdata: table={table} ({len(raw)} bytes)")
+        log.info(f"[{SN}] cdata biodata sample: {raw[:300]!r}")
+        # Coba kedua parser — querydata format (key=value) lebih umum di fw8.x
+        count = store_querydata_biodata(SN, raw)
+        if count == 0:
+            count = len([l for l in raw.splitlines() if l.strip()])
+            store_biodata(SN, raw)
     else:
-        log.info(f"[{SN}] Tabel tidak dikenal: table={table} Stamp={Stamp} body={raw[:200]!r}")
+        log.info(f"[{SN}] Tabel tidak dikenal: table={table} Stamp={Stamp} body={raw[:300]!r}")
     return PlainTextResponse("OK")
 
 
@@ -400,16 +405,27 @@ async def get_request(SN: str = Query(...), INFO: str = Query(None)):
 
 
 @app_router.post("/iclock/devicecmd", response_class=PlainTextResponse)
-async def device_cmd(SN: str = Query(...), ID: str = Query(None), Return: str = Query(None)):
-    if ID:
+async def device_cmd(request: Request, SN: str = Query(...)):
+    # Log SEMUA query params supaya bisa debug field name yang dipakai device
+    params = dict(request.query_params)
+    body = (await request.body()).decode("utf-8", errors="ignore")
+    log.info(f"[{SN}] devicecmd params={params} body={body[:300]!r}")
+
+    # ZKTeco firmware bisa pakai 'ID' atau 'Cmd' atau tidak kirim ID sama sekali
+    cmd_id = params.get("ID") or params.get("Cmd") or params.get("cmd")
+    return_val = params.get("Return") or params.get("return")
+
+    if cmd_id:
         try:
             db_run(
                 "UPDATE adms_command_queue SET acked_at = NOW() WHERE id = %s",
-                (int(ID),),
+                (int(cmd_id),),
             )
-            log.info(f"[{SN}] Command #{ID} dikonfirmasi (Return={Return})")
+            log.info(f"[{SN}] Command #{cmd_id} dikonfirmasi (Return={return_val})")
         except Exception as exc:
-            log.warning(f"[{SN}] Gagal konfirmasi command {ID}: {exc}")
+            log.warning(f"[{SN}] Gagal konfirmasi command {cmd_id}: {exc}")
+    else:
+        log.warning(f"[{SN}] devicecmd tanpa ID — device mungkin tidak support command terakhir (Return={return_val})")
     return PlainTextResponse("OK")
 
 
@@ -544,29 +560,32 @@ async def inject_fingerprints(target: str = Query(None)):
 
 @app_router.get("/pull-fingerprints")
 async def pull_fingerprints(sn: str = Query(None)):
-    """Antrekan command DATA QUERY biodata ke semua mesin (atau mesin tertentu via ?sn=...).
+    """Antrekan command DATA QUERY untuk menarik fingerprint dari mesin.
 
-    Mesin polling /iclock/getrequest setiap ~30 detik, menerima command, lalu
-    POST fingerprint ke /iclock/querydata secara otomatis.
+    Coba dua table name: 'biodata' (fw8.x unified) dan 'templatev10' (legacy).
+    Device merespons ke /iclock/querydata atau /iclock/cdata tergantung firmware.
     """
     device_sns = [sn] if sn else get_all_device_sns()
     if not device_sns:
         return {"error": "Belum ada mesin terdaftar. Pastikan mesin sudah handshake ke server."}
 
+    # Coba kedua format — mesin akan ignore yang tidak didukung
+    query_tables = ["DATA QUERY biodata", "DATA QUERY templatev10"]
     statements = []
     for target_sn in device_sns:
-        statements.append((
-            "INSERT INTO adms_command_queue (target_device, command_text) VALUES (%s, %s)",
-            (target_sn, "DATA QUERY biodata"),
-        ))
+        for cmd in query_tables:
+            statements.append((
+                "INSERT INTO adms_command_queue (target_device, command_text) VALUES (%s, %s)",
+                (target_sn, cmd),
+            ))
     db_run_many(statements)
 
-    log.info(f"Queued DATA QUERY biodata ke {len(device_sns)} mesin: {device_sns}")
+    log.info(f"Queued {query_tables} ke {len(device_sns)} mesin: {device_sns}")
     return {
         "status": "ok",
         "devices": device_sns,
-        "queued_command": "DATA QUERY biodata",
-        "note": "Mesin akan merespons ke /iclock/querydata saat polling berikutnya (~30 detik).",
+        "queued_commands": query_tables,
+        "note": "Pantau log untuk melihat response dari mesin (~30-60 detik).",
     }
 
 
