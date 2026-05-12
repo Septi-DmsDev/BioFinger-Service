@@ -311,10 +311,11 @@ async def receive_data(request: Request, SN: str = Query(...), table: str = Quer
     raw = body.decode("utf-8", errors="ignore")
     if table == "ATTLOG":
         store_punches(SN, raw)
-    elif table == "BIODATA":
+    elif table in ("BIODATA", "FP", "FPTRANSACTION"):
+        log.info(f"[{SN}] Menerima tabel biometrik: {table} ({len(raw)} bytes)")
         store_biodata(SN, raw)
     else:
-        log.debug(f"[{SN}] Tabel {table} diabaikan.")
+        log.info(f"[{SN}] Tabel tidak dikenal: table={table} Stamp={Stamp} body={raw[:200]!r}")
     return PlainTextResponse("OK")
 
 
