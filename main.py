@@ -293,7 +293,7 @@ async def health():
     return {"status": "ok", "time": datetime.now(WIB).isoformat()}
 
 
-@app_router.post("/sync/{target_date}")
+@app_router.get("/sync/{target_date}")
 async def trigger_sync(target_date: str):
     """Trigger manual sync untuk tanggal tertentu (format: YYYY-MM-DD)."""
     try:
@@ -304,7 +304,7 @@ async def trigger_sync(target_date: str):
     return {"status": "ok", "synced_date": target_date}
 
 
-@app_router.post("/sync-now")
+@app_router.get("/sync-now")
 async def trigger_sync_now():
     """Trigger manual sync untuk hari ini dan kemarin."""
     scheduled_sync()
