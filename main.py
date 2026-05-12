@@ -348,17 +348,19 @@ app_router = FastAPI(title="ADMS Receiver")
 async def device_handshake(SN: str = Query(...), options: str = Query(None), pushver: str = Query(None)):
     register_device(SN)
     log.info(f"[{SN}] Handshake dari mesin.")
-    # BIODATAStamp/FPTrans tidak dipakai — AT301 fw8.x tidak auto-push fingerprint.
-    # Fingerprint diambil via DATA QUERY biodata (aktif oleh server, bukan mesin).
+    # FPTrans=1 diperlukan agar device mengizinkan DATA QUERY biodata (Return=-3 jika tidak ada).
+    # BIODATAStamp=0 → jika device mendukung auto-push biodata, mulai dari awal.
     config = (
         f"GET OPTION FROM: {SN}\r\n"
         f"ATTLOGStamp=0\r\n"
         f"OPERLOGStamp=9999\r\n"
+        f"BIODATAStamp=0\r\n"
+        f"FPTrans=1\r\n"
         f"ErrorDelay=30\r\n"
         f"Delay=10\r\n"
         f"TransTimes=09:00;14:00;17:00;21:00\r\n"
         f"TransInterval=1\r\n"
-        f"TransFlag=TransData AttLog\r\n"
+        f"TransFlag=TransData AttLog FPTrans\r\n"
         f"TimeZone=7\r\n"
         f"Realtime=1\r\n"
         f"Encrypt=None\r\n"
@@ -406,14 +408,21 @@ async def get_request(SN: str = Query(...), INFO: str = Query(None)):
 
 @app_router.post("/iclock/devicecmd", response_class=PlainTextResponse)
 async def device_cmd(request: Request, SN: str = Query(...)):
-    # Log SEMUA query params supaya bisa debug field name yang dipakai device
-    params = dict(request.query_params)
+    # Device mengirim ID & Return di BODY (form-encoded), bukan query params
     body = (await request.body()).decode("utf-8", errors="ignore")
-    log.info(f"[{SN}] devicecmd params={params} body={body[:300]!r}")
+    body_params: dict[str, str] = {}
+    for part in body.strip().split("&"):
+        if "=" in part:
+            k, _, v = part.partition("=")
+            body_params[k.strip()] = v.strip()
 
-    # ZKTeco firmware bisa pakai 'ID' atau 'Cmd' atau tidak kirim ID sama sekali
-    cmd_id = params.get("ID") or params.get("Cmd") or params.get("cmd")
-    return_val = params.get("Return") or params.get("return")
+    # Fallback ke query params jika tidak ada di body
+    qp = dict(request.query_params)
+    cmd_id = body_params.get("ID") or qp.get("ID")
+    return_val = body_params.get("Return") or qp.get("Return")
+    cmd_type = body_params.get("CMD") or qp.get("CMD", "")
+
+    log.info(f"[{SN}] devicecmd ID={cmd_id} Return={return_val} CMD={cmd_type!r}")
 
     if cmd_id:
         try:
@@ -421,11 +430,15 @@ async def device_cmd(request: Request, SN: str = Query(...)):
                 "UPDATE adms_command_queue SET acked_at = NOW() WHERE id = %s",
                 (int(cmd_id),),
             )
-            log.info(f"[{SN}] Command #{cmd_id} dikonfirmasi (Return={return_val})")
+            ret_int = int(return_val or "0")
+            if ret_int == 0:
+                log.info(f"[{SN}] Command #{cmd_id} berhasil (Return=0)")
+            else:
+                log.warning(f"[{SN}] Command #{cmd_id} GAGAL (Return={ret_int}): CMD={cmd_type!r}")
         except Exception as exc:
-            log.warning(f"[{SN}] Gagal konfirmasi command {cmd_id}: {exc}")
+            log.warning(f"[{SN}] Gagal proses devicecmd #{cmd_id}: {exc}")
     else:
-        log.warning(f"[{SN}] devicecmd tanpa ID — device mungkin tidak support command terakhir (Return={return_val})")
+        log.warning(f"[{SN}] devicecmd tanpa ID — body={body[:200]!r}")
     return PlainTextResponse("OK")
 
 
@@ -569,23 +582,20 @@ async def pull_fingerprints(sn: str = Query(None)):
     if not device_sns:
         return {"error": "Belum ada mesin terdaftar. Pastikan mesin sudah handshake ke server."}
 
-    # Coba kedua format — mesin akan ignore yang tidak didukung
-    query_tables = ["DATA QUERY biodata", "DATA QUERY templatev10"]
     statements = []
     for target_sn in device_sns:
-        for cmd in query_tables:
-            statements.append((
-                "INSERT INTO adms_command_queue (target_device, command_text) VALUES (%s, %s)",
-                (target_sn, cmd),
-            ))
+        statements.append((
+            "INSERT INTO adms_command_queue (target_device, command_text) VALUES (%s, %s)",
+            (target_sn, "DATA QUERY biodata"),
+        ))
     db_run_many(statements)
 
-    log.info(f"Queued {query_tables} ke {len(device_sns)} mesin: {device_sns}")
+    log.info(f"Queued DATA QUERY biodata ke {len(device_sns)} mesin: {device_sns}")
     return {
         "status": "ok",
         "devices": device_sns,
-        "queued_commands": query_tables,
-        "note": "Pantau log untuk melihat response dari mesin (~30-60 detik).",
+        "queued_command": "DATA QUERY biodata",
+        "note": "Mesin perlu handshake dulu dengan config FPTrans=1 sebelum QUERY berhasil.",
     }
 
 
