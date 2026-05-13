@@ -34,6 +34,7 @@ ADMS_INGEST_TOKEN = os.environ.get("ADMS_INGEST_TOKEN", "")
 
 _parsed = urlparse(HRD_API_URL)
 HRD_EMPLOYEES_URL = f"{_parsed.scheme}://{_parsed.netloc}/api/integrations/adms/employees"
+HRD_TAPS_URL      = f"{_parsed.scheme}://{_parsed.netloc}/api/integrations/adms/taps"
 
 WIB = timezone(timedelta(hours=7))
 
@@ -126,20 +127,20 @@ def store_punches(device_sn: str, raw_body: str):
 # ---------------------------------------------------------------------------
 # Batch sender ke HRD Dashboard
 # ---------------------------------------------------------------------------
-PUNCH_MASUK            = 0
-PUNCH_PULANG           = 1
-PUNCH_KELUAR_ISTIRAHAT = 2
-PUNCH_MASUK_ISTIRAHAT  = 3
-
-
 def send_batch_for_date(target_date: date):
+    """Kirim semua tap mentah hari target_date ke HRD Dashboard.
+
+    HRD Dashboard yang mengklasifikasikan tiap tap (check_in / break_out /
+    break_in / check_out) berdasarkan jadwal kerja masing-masing karyawan.
+    punch_type dari mesin diabaikan sepenuhnya — jam tap yang menentukan.
+    """
     if not ADMS_INGEST_TOKEN:
         log.warning("ADMS_INGEST_TOKEN belum diset, batch dilewati.")
         return
 
     date_str = target_date.isoformat()
     rows = db_all("""
-        SELECT device_sn, employee_code, punch_time, punch_type
+        SELECT device_sn, employee_code, punch_time
         FROM adms_punch_logs
         WHERE punch_time::date = %s
         ORDER BY punch_time ASC
@@ -149,64 +150,43 @@ def send_batch_for_date(target_date: date):
         log.info(f"[{date_str}] Tidak ada data punch.")
         return
 
-    groups: dict[tuple, dict] = {}
+    # Gabungkan tap dari semua device; deduplikasi per (employee_code, HH:MM).
+    seen: set[tuple] = set()
+    taps: list[dict] = []
     for row in rows:
-        key = (row["device_sn"], row["employee_code"])
-        if key not in groups:
-            groups[key] = {
-                "device_sn": row["device_sn"],
-                "employee_code": row["employee_code"],
-                "check_in": None, "check_out": None,
-                "break_out": None, "break_in": None,
-            }
-        g = groups[key]
         t = row["punch_time"].strftime("%H:%M")
-        pt = row["punch_type"]
-        if pt == PUNCH_MASUK and not g["check_in"]:
-            g["check_in"] = t
-        elif pt == PUNCH_PULANG:
-            g["check_out"] = t
-        elif pt == PUNCH_KELUAR_ISTIRAHAT and not g["break_out"]:
-            g["break_out"] = t
-        elif pt == PUNCH_MASUK_ISTIRAHAT and not g["break_in"]:
-            g["break_in"] = t
+        key = (row["employee_code"], t)
+        if key in seen:
+            continue
+        seen.add(key)
+        taps.append({
+            "employeeCode": row["employee_code"],
+            "time": t,
+            "deviceId": row["device_sn"],
+        })
 
-    by_device: dict[str, list] = {}
-    for (device_sn, emp_code), g in groups.items():
-        record: dict = {
-            "employeeCode": emp_code,
-            "attendanceDate": date_str,
-            "attendanceStatus": "HADIR",
-        }
-        if g["check_in"]:  record["checkInTime"]  = g["check_in"]
-        if g["check_out"]: record["checkOutTime"] = g["check_out"]
-        if g["break_out"]: record["breakOutTime"] = g["break_out"]
-        if g["break_in"]:  record["breakInTime"]  = g["break_in"]
-        by_device.setdefault(device_sn, []).append(record)
-
-    for device_sn, records in by_device.items():
-        try:
-            resp = requests.post(
-                HRD_API_URL,
-                headers={
-                    "Authorization": f"Bearer {ADMS_INGEST_TOKEN}",
-                    "Content-Type": "application/json",
-                },
-                json={"deviceId": device_sn, "records": records},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            result = resp.json()
-            log.info(
-                f"[{device_sn}] {date_str} — "
-                f"inserted:{result.get('inserted', 0)} "
-                f"updated:{result.get('updated', 0)} "
-                f"skipped:{result.get('skipped', 0)}"
-            )
-            for err in (result.get("errors") or [])[:5]:
-                log.warning(f"  skip [{err.get('employeeCode')}]: {err.get('reason')}")
-        except Exception as exc:
-            log.error(f"[{device_sn}] Gagal kirim batch {date_str}: {exc}")
+    try:
+        resp = requests.post(
+            HRD_TAPS_URL,
+            headers={
+                "Authorization": f"Bearer {ADMS_INGEST_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={"date": date_str, "taps": taps},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        log.info(
+            f"[{date_str}] taps={len(taps)} karyawan={result.get('total', 0)} "
+            f"inserted:{result.get('inserted', 0)} "
+            f"updated:{result.get('updated', 0)} "
+            f"skipped:{result.get('skipped', 0)}"
+        )
+        for err in (result.get("errors") or [])[:5]:
+            log.warning(f"  skip [{err.get('employeeCode')}]: {err.get('reason')}")
+    except Exception as exc:
+        log.error(f"Gagal kirim taps {date_str}: {exc}")
 
 
 def scheduled_sync():
