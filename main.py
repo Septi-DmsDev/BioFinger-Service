@@ -353,7 +353,10 @@ async def inject_employees(force: int = Query(0)):
     if not device_sns:
         return {"error": "Belum ada mesin terdaftar. Pastikan mesin sudah terhubung ke server."}
 
-    db_run("DELETE FROM adms_command_queue WHERE sent_at IS NULL AND command_text LIKE 'DATA USER%'")
+    db_run(
+        "DELETE FROM adms_command_queue WHERE sent_at IS NULL AND command_text LIKE %s",
+        ("DATA USER%",),
+    )
 
     statements = []
     skipped_per_device: dict[str, int] = {}
@@ -366,8 +369,8 @@ async def inject_employees(force: int = Query(0)):
                 SELECT command_text FROM adms_command_queue
                 WHERE target_device = %s
                   AND sent_at IS NOT NULL
-                  AND command_text LIKE 'DATA USER PIN=%'
-            """, (sn,))
+                  AND command_text LIKE %s
+            """, (sn, "DATA USER PIN=%"))
             already_sent = set()
             for r in rows:
                 try:
