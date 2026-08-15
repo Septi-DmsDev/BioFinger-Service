@@ -7,7 +7,7 @@ Mesin AT301 push langsung ke server ini via internet — tidak perlu komputer ta
 
 ```
 [AT301 Kantor A] ──internet──▶
-[AT301 Kantor B] ──internet──▶  [adms.it-teknos.site:443] ──▶ [hris.it-teknos.site/api/...]
+[AT301 Kantor B] ──internet──▶  [adms.it-company.site:443] ──▶ [hris.it-company.site/api/...]
 [AT301 Kantor C] ──internet──▶
 ```
 
@@ -15,10 +15,10 @@ Mesin AT301 push langsung ke server ini via internet — tidak perlu komputer ta
 
 ```bash
 # Upload file ke VPS
-scp main.py adms.service setup.sh ubuntu@hris-supa.it-teknos.site:/tmp/adms-setup/
+scp main.py adms.service setup.sh ubuntu@hris-supa.it-company.site:/tmp/adms-setup/
 
 # SSH ke VPS
-ssh ubuntu@hris-supa.it-teknos.site
+ssh ubuntu@hris-supa.it-company.site
 
 # Jalankan setup (perlu sudo)
 cd /tmp/adms-setup
@@ -38,7 +38,7 @@ Setelah server jalan, masuk ke settings mesin:
 **Melalui LCD mesin:**
 1. Menu → Communication → Cloud Server
 2. Enable Cloud Server: **ON**
-3. Server Address: `adms.it-teknos.site`
+3. Server Address: `adms.it-company.site`
 4. Server Port: `80` (atau `443` jika HTTPS sudah aktif)
 5. HTTPS: `ON` (setelah Certbot selesai)
 6. Save → Reboot mesin
@@ -58,7 +58,7 @@ sudo systemctl status adms-receiver
 sudo journalctl -u adms-receiver -f
 
 # Health check
-curl https://adms.it-teknos.site/health
+curl https://adms.company.site/health
 ```
 
 ## Sync manual (untuk catch-up data lama)
@@ -91,7 +91,7 @@ Setelah menerima data dari mesin, server mengagregasi dan mengirim batch ke API 
 
 | Masalah | Cek |
 |---------|-----|
-| Mesin tidak connect | Pastikan `adms.it-teknos.site` bisa diping dari jaringan kantor |
+| Mesin tidak connect | Pastikan `adms.company.site` bisa diping dari jaringan kantor |
 | Data tidak masuk | `journalctl -u adms-receiver -f` — lihat log push masuk |
 | Batch tidak terkirim | Cek ADMS_INGEST_TOKEN di service config |
 | Mesin AT301 tidak ada menu Cloud | Cari "ADMS" atau "Wiegand" di menu Communication |
