@@ -28,7 +28,7 @@ from fastapi.responses import PlainTextResponse
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 HRD_API_URL = os.environ.get(
     "HRD_API_URL",
-    "https://hris.it-teknos.site/api/integrations/adms/attendance",
+    "https://hris.company.site/api/integrations/adms/attendance",
 )
 ADMS_INGEST_TOKEN = os.environ.get("ADMS_INGEST_TOKEN", "")
 
