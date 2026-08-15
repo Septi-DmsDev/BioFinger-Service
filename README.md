@@ -7,7 +7,7 @@ Mesin AT301 push langsung ke server ini via internet — tidak perlu komputer ta
 
 ```
 [AT301 Kantor A] ──internet──▶
-[AT301 Kantor B] ──internet──▶  [adms.it-company.site:443] ──▶ [hris.it-company.site/api/...]
+[AT301 Kantor B] ──internet──▶  [adms.company.site:443] ──▶ [hris.company.site/api/...]
 [AT301 Kantor C] ──internet──▶
 ```
 
@@ -15,10 +15,10 @@ Mesin AT301 push langsung ke server ini via internet — tidak perlu komputer ta
 
 ```bash
 # Upload file ke VPS
-scp main.py adms.service setup.sh ubuntu@hris-supa.it-company.site:/tmp/adms-setup/
+scp main.py adms.service setup.sh ubuntu@hris-supa.company.site:/tmp/adms-setup/
 
 # SSH ke VPS
-ssh ubuntu@hris-supa.it-company.site
+ssh ubuntu@hris-supa.company.site
 
 # Jalankan setup (perlu sudo)
 cd /tmp/adms-setup
@@ -38,7 +38,7 @@ Setelah server jalan, masuk ke settings mesin:
 **Melalui LCD mesin:**
 1. Menu → Communication → Cloud Server
 2. Enable Cloud Server: **ON**
-3. Server Address: `adms.it-company.site`
+3. Server Address: `adms.company.site`
 4. Server Port: `80` (atau `443` jika HTTPS sudah aktif)
 5. HTTPS: `ON` (setelah Certbot selesai)
 6. Save → Reboot mesin
