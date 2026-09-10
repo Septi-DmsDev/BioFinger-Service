@@ -59,6 +59,18 @@ sudo journalctl -u adms-receiver -f
 
 # Health check
 curl https://adms.company.site/health
+
+# Daftar mesin terhubung
+curl https://adms.company.site/devices
+
+# Sinkronkan jam mesin ke waktu WIB (Asia/Jakarta, UTC+7)
+curl https://adms.company.site/sync-time
+
+# Upload karyawan dari HRD ke mesin
+curl https://adms.company.site/inject-employees
+
+# Hapus seluruh karyawan di mesin
+curl https://adms.company.site/clear-employees?confirm=yes
 ```
 
 ## Sync manual (untuk catch-up data lama)

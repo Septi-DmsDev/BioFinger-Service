@@ -50,7 +50,11 @@ log = logging.getLogger("adms")
 # Database helpers
 # ---------------------------------------------------------------------------
 def get_db():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    return psycopg2.connect(
+        DATABASE_URL,
+        options="-c timezone=Asia/Jakarta",
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    )
 
 
 def db_one(sql: str, params: tuple = ()):
@@ -210,6 +214,20 @@ async def device_handshake(
 ):
     register_device(SN)
     log.info(f"[{SN}] Handshake (pushver={pushver})")
+
+    # Pastikan mesin disinkronkan jamnya ke WIB jika belum ada antrean waktu
+    has_time_cmd = db_one(
+        "SELECT 1 FROM adms_command_queue WHERE target_device = %s AND sent_at IS NULL AND command_text LIKE %s",
+        (SN, "SET OPTIONS DateTime%"),
+    )
+    if not has_time_cmd:
+        now_wib = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
+        db_run(
+            "INSERT INTO adms_command_queue (target_device, command_text) VALUES (%s, %s)",
+            (SN, f"SET OPTIONS DateTime={now_wib}"),
+        )
+        log.info(f"[{SN}] Auto-queue sinkronisasi waktu mesin: {now_wib} WIB")
+
     config = (
         f"GET OPTION FROM: {SN}\r\n"
         f"ATTLOGStamp=0\r\n"
@@ -222,6 +240,7 @@ async def device_handshake(
         f"TimeZone=7\r\n"
         f"Realtime=1\r\n"
         f"Encrypt=None\r\n"
+        f"ServerVer=3.4.1\r\n"
     )
     return PlainTextResponse(config)
 
@@ -426,6 +445,58 @@ async def trigger_sync_now():
     """Kirim data absensi hari ini dan kemarin ke HRD Dashboard sekarang."""
     scheduled_sync()
     return {"status": "ok", "time": datetime.now(WIB).isoformat()}
+
+
+@app_router.get("/sync-time")
+async def sync_device_time():
+    """Kirim perintah sinkronisasi jam mesin ke waktu WIB (Asia/Jakarta, UTC+7)."""
+    device_sns = get_all_device_sns()
+    if not device_sns:
+        return {"error": "Belum ada mesin terdaftar. Pastikan mesin sudah terhubung ke server."}
+
+    now_wib = datetime.now(WIB).strftime("%Y-%m-%d %H:%M:%S")
+    cmd = f"SET OPTIONS DateTime={now_wib}"
+    statements = [
+        ("INSERT INTO adms_command_queue (target_device, command_text) VALUES (%s, %s)", (sn, cmd))
+        for sn in device_sns
+    ]
+    db_run_many(statements)
+    log.info(f"Antrekan sinkronisasi waktu mesin ({now_wib}) ke {len(device_sns)} mesin: {device_sns}")
+    return {
+        "status": "ok",
+        "time_wib": now_wib,
+        "devices": device_sns,
+        "queued_command": cmd,
+        "message": "Perintah sync jam mesin ke UTC+7 (WIB) telah diantrekan ke semua mesin.",
+    }
+
+
+@app_router.get("/clear-employees")
+async def clear_all_employees(confirm: str = Query(None)):
+    """Hapus seluruh user di semua mesin fingerprint via ADMS.
+    Wajib tambahkan ?confirm=yes untuk konfirmasi penghapusan seluruh karyawan di mesin.
+    """
+    if confirm != "yes":
+        return {"error": "Tambahkan ?confirm=yes untuk konfirmasi penghapusan seluruh karyawan di mesin."}
+
+    device_sns = get_all_device_sns()
+    if not device_sns:
+        return {"error": "Belum ada mesin terdaftar."}
+
+    # Hapus antrean user lama agar bersih
+    db_run("DELETE FROM adms_command_queue WHERE command_text LIKE 'DATA USER%'")
+
+    statements = [
+        ("INSERT INTO adms_command_queue (target_device, command_text) VALUES (%s, %s)", (sn, "DATA DELETE user *"))
+        for sn in device_sns
+    ]
+    db_run_many(statements)
+    log.info(f"Antrekan hapus seluruh karyawan ke {len(device_sns)} mesin: {device_sns}")
+    return {
+        "status": "ok",
+        "devices": device_sns,
+        "message": "Perintah 'DATA DELETE user *' telah diantrekan ke semua mesin.",
+    }
 
 
 # ---------------------------------------------------------------------------
