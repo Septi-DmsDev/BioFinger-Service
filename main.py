@@ -28,13 +28,20 @@ from fastapi.responses import PlainTextResponse
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 HRD_API_URL = os.environ.get(
     "HRD_API_URL",
-    "https://hris.company.site/api/integrations/adms/attendance",
+    "https://hris.it-teknos.site/api/integrations/adms/attendance",
 )
-ADMS_INGEST_TOKEN = os.environ.get("ADMS_INGEST_TOKEN", "")
+ADMS_INGEST_TOKEN = os.environ.get("ADMS_INGEST_TOKEN", "").strip().strip("\"'").strip()
 
 _parsed = urlparse(HRD_API_URL)
 HRD_EMPLOYEES_URL = f"{_parsed.scheme}://{_parsed.netloc}/api/integrations/adms/employees"
 HRD_TAPS_URL      = f"{_parsed.scheme}://{_parsed.netloc}/api/integrations/adms/taps"
+
+# HTTP session dengan custom User-Agent browser agar tidak diblokir Cloudflare WAF bot filter
+http_session = requests.Session()
+http_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 BioFinger-ADMS/1.0",
+    "Accept": "application/json",
+})
 
 WIB = timezone(timedelta(hours=7))
 
@@ -131,7 +138,7 @@ def store_punches(device_sn: str, raw_body: str):
 # ---------------------------------------------------------------------------
 # Batch sender ke HRD Dashboard
 # ---------------------------------------------------------------------------
-def send_batch_for_date(target_date: date):
+def send_batch_for_date(target_date: date) -> dict:
     """Kirim semua tap mentah hari target_date ke HRD Dashboard.
 
     HRD Dashboard yang mengklasifikasikan tiap tap (check_in / break_out /
@@ -140,7 +147,7 @@ def send_batch_for_date(target_date: date):
     """
     if not ADMS_INGEST_TOKEN:
         log.warning("ADMS_INGEST_TOKEN belum diset, batch dilewati.")
-        return
+        return {"status": "error", "error": "ADMS_INGEST_TOKEN belum diset di service ADMS."}
 
     date_str = target_date.isoformat()
     rows = db_all("""
@@ -152,7 +159,7 @@ def send_batch_for_date(target_date: date):
 
     if not rows:
         log.info(f"[{date_str}] Tidak ada data punch.")
-        return
+        return {"status": "ok", "date": date_str, "total_punches": 0, "message": "Tidak ada data punch."}
 
     # Gabungkan tap dari semua device; deduplikasi per (employee_code, HH:MM).
     seen: set[tuple] = set()
@@ -170,7 +177,7 @@ def send_batch_for_date(target_date: date):
         })
 
     try:
-        resp = requests.post(
+        resp = http_session.post(
             HRD_TAPS_URL,
             headers={
                 "Authorization": f"Bearer {ADMS_INGEST_TOKEN}",
@@ -189,15 +196,33 @@ def send_batch_for_date(target_date: date):
         )
         for err in (result.get("errors") or [])[:5]:
             log.warning(f"  skip [{err.get('employeeCode')}]: {err.get('reason')}")
+        return {
+            "status": "ok",
+            "date": date_str,
+            "total_punches": len(rows),
+            "unique_taps": len(taps),
+            "hris_result": result,
+        }
     except Exception as exc:
         log.error(f"Gagal kirim taps {date_str}: {exc}")
+        return {
+            "status": "error",
+            "date": date_str,
+            "total_punches": len(rows),
+            "unique_taps": len(taps),
+            "error": str(exc),
+        }
 
 
-def scheduled_sync():
+def scheduled_sync() -> dict:
     today = datetime.now(WIB).date()
     log.info(f"=== Scheduled sync: {today} ===")
-    send_batch_for_date(today)
-    send_batch_for_date(today - timedelta(days=1))
+    res_today = send_batch_for_date(today)
+    res_yesterday = send_batch_for_date(today - timedelta(days=1))
+    return {
+        "today": res_today,
+        "yesterday": res_yesterday,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +380,7 @@ async def inject_employees(force: int = Query(0)):
         return {"error": "ADMS_INGEST_TOKEN belum diset."}
 
     try:
-        resp = requests.get(
+        resp = http_session.get(
             HRD_EMPLOYEES_URL,
             headers={"Authorization": f"Bearer {ADMS_INGEST_TOKEN}"},
             timeout=30,
@@ -436,15 +461,23 @@ async def trigger_sync(target_date: str):
         d = date.fromisoformat(target_date)
     except ValueError:
         return {"error": "Format tanggal tidak valid. Gunakan YYYY-MM-DD."}
-    send_batch_for_date(d)
-    return {"status": "ok", "synced_date": target_date}
+    res = send_batch_for_date(d)
+    return {"status": res.get("status", "ok"), "synced_date": target_date, "detail": res}
 
 
 @app_router.get("/sync-now")
 async def trigger_sync_now():
     """Kirim data absensi hari ini dan kemarin ke HRD Dashboard sekarang."""
-    scheduled_sync()
-    return {"status": "ok", "time": datetime.now(WIB).isoformat()}
+    sync_results = scheduled_sync()
+    has_error = (
+        sync_results.get("today", {}).get("status") == "error"
+        or sync_results.get("yesterday", {}).get("status") == "error"
+    )
+    return {
+        "status": "error" if has_error else "ok",
+        "time": datetime.now(WIB).isoformat(),
+        **sync_results,
+    }
 
 
 @app_router.get("/sync-time")
