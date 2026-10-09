@@ -185,6 +185,7 @@ def send_batch_for_date(target_date: date) -> dict:
             },
             json={"date": date_str, "taps": taps},
             timeout=30,
+            allow_redirects=False,
         )
         resp.raise_for_status()
         result = resp.json()
@@ -384,6 +385,7 @@ async def inject_employees(force: int = Query(0)):
             HRD_EMPLOYEES_URL,
             headers={"Authorization": f"Bearer {ADMS_INGEST_TOKEN}"},
             timeout=30,
+            allow_redirects=False,
         )
         resp.raise_for_status()
         emp_list = resp.json().get("employees", [])
